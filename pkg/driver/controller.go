@@ -233,6 +233,39 @@ func (cs *controller) init() error {
 	return nil
 }
 
+func GetLVMSnapshotVolume(ctx context.Context, req *csi.CreateVolumeRequest,
+	params *VolumeParams) (*lvmapi.LVMSnapshot, error) {
+	// volName := strings.ToLower(req.GetName())
+	contentSource := req.GetVolumeContentSource()
+	volName := strings.Split(contentSource.GetSnapshot().GetSnapshotId(), "@")[1]
+	capacity := strconv.FormatInt(getRoundedCapacity(
+		req.GetCapacityRange().RequiredBytes), 10)
+
+	vol, err := lvm.GetLVMSnapshot(strings.Split(contentSource.GetSnapshot().GetSnapshotId(), "@")[1])
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted,
+			"failed get lvm snapshot %v: %v", volName, err.Error())
+	}
+
+	klog.Infof("scheduling the volume %s/%s on node %s",
+		params.VgPattern.String(), volName, vol.Spec.OwnerNodeID)
+
+	_, err = volbuilder.NewBuilder().
+		WithName(volName).
+		WithCapacity(capacity).
+		WithVgPattern(params.VgPattern.String()).
+		WithOwnerNode(vol.Spec.OwnerNodeID).
+		WithVolumeStatus(lvm.LVMStatusPending).
+		WithShared(params.Shared).
+		WithThinProvision(params.ThinProvision).Build()
+
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return vol, err
+}
+
 // CreateLVMVolume create new lvm volume for csi volume request
 func CreateLVMVolume(ctx context.Context, req *csi.CreateVolumeRequest,
 	params *VolumeParams) (*lvmapi.LVMVolume, error) {
@@ -311,24 +344,37 @@ func (cs *controller) CreateVolume(
 	ctx context.Context,
 	req *csi.CreateVolumeRequest,
 ) (*csi.CreateVolumeResponse, error) {
-
 	if err := cs.validateVolumeCreateReq(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
 	params, err := NewVolumeParams(req.GetParameters())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument,
 			"failed to parse csi volume params: %v", err)
 	}
 
-	volName := strings.ToLower(req.GetName())
+	var volName = strings.ToLower(req.GetName())
 	size := getRoundedCapacity(req.GetCapacityRange().GetRequiredBytes())
 	contentSource := req.GetVolumeContentSource()
 
 	var vol *lvmapi.LVMVolume
+	var snapvol *lvmapi.LVMSnapshot
+	klog.Infof("blaat1 %v", contentSource)
 	if contentSource != nil && contentSource.GetSnapshot() != nil {
-		return nil, status.Error(codes.Unimplemented, "")
+		klog.Infof("blaat3 %v", contentSource)
+		// // return nil, status.Error(codes.Unimplemented, "")
+		volName = strings.Split(contentSource.GetSnapshot().GetSnapshotId(), "@")[1]
+		// var finishCreateVolume func()
+		// if finishCreateVolume, err = cs.leakProtection.BeginCreateVolume(volName,
+		// 	params.PVCNamespace, params.PVCName); err != nil {
+		// 	return nil, err
+		// }
+		// defer finishCreateVolume()
+		snapvol, err = GetLVMSnapshotVolume(ctx, req, params)
+		// if err != nil {
+		// 	klog.Errorf("Blaat %v", err)
+		// }
+		// vol, err = CreateLVMVolume(ctx, req, params)
 	} else if contentSource != nil && contentSource.GetVolume() != nil {
 		return nil, status.Error(codes.Unimplemented, "")
 	} else {
@@ -343,16 +389,21 @@ func (cs *controller) CreateVolume(
 
 		vol, err = CreateLVMVolume(ctx, req, params)
 	}
-
 	if err != nil {
 		return nil, err
 	}
 	sendEventOrIgnore(params.PVCName, volName,
 		strconv.FormatInt(int64(size), 10),
 		"lvm-localpv", analytics.VolumeProvision)
-
-	topology := map[string]string{lvm.LVMTopologyKey: vol.Spec.OwnerNodeID}
-	cntx := map[string]string{lvm.VolGroupKey: vol.Spec.VolGroup, lvm.OpenEBSCasTypeKey: lvm.LVMCasTypeName}
+	var topology map[string]string
+	var cntx map[string]string
+	if vol != nil {
+		topology = map[string]string{lvm.LVMTopologyKey: vol.Spec.OwnerNodeID}
+		cntx = map[string]string{lvm.VolGroupKey: vol.Spec.VolGroup, lvm.OpenEBSCasTypeKey: lvm.LVMCasTypeName}
+	} else {
+		topology = map[string]string{lvm.LVMTopologyKey: snapvol.Spec.OwnerNodeID}
+		cntx = map[string]string{lvm.VolGroupKey: snapvol.Spec.VolGroup, lvm.OpenEBSCasTypeKey: lvm.LVMCasTypeName}
+	}
 
 	return csipayload.NewCreateVolumeResponseBuilder().
 		WithName(volName).

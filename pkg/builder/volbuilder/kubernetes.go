@@ -53,6 +53,15 @@ type getFn func(
 	opts metav1.GetOptions,
 ) (*apis.LVMVolume, error)
 
+// getSnapshotFn is a typed function that abstracts
+// fetching a lvm snapshot instance
+type getSnapshotFn func(
+	cli *clientset.Clientset,
+	name,
+	namespace string,
+	opts metav1.GetOptions,
+) (*apis.LVMSnapshot, error)
+
 // listFn is a typed function that abstracts
 // listing of lvm volume instances
 type listFn func(
@@ -96,6 +105,7 @@ type Kubeclient struct {
 	getClientset        getClientsetFn
 	getClientsetForPath getClientsetForPathFn
 	get                 getFn
+	getSnapshot         getSnapshotFn
 	list                listFn
 	del                 delFn
 	create              createFn
@@ -143,6 +153,18 @@ func defaultGet(
 ) (*apis.LVMVolume, error) {
 	return cli.LocalV1alpha1().
 		LVMVolumes(namespace).
+		Get(context.TODO(), name, opts)
+}
+
+// defaultSnapshotGet is the default implementation to get
+// a lvm snatshot instance in kubernetes cluster
+func defaultSnapshotGet(
+	cli *clientset.Clientset,
+	name, namespace string,
+	opts metav1.GetOptions,
+) (*apis.LVMSnapshot, error) {
+	return cli.LocalV1alpha1().
+		LVMSnapshots(namespace).
 		Get(context.TODO(), name, opts)
 }
 
@@ -208,6 +230,9 @@ func (k *Kubeclient) withDefaults() {
 	}
 	if k.get == nil {
 		k.get = defaultGet
+	}
+	if k.getSnapshot == nil {
+		k.getSnapshot = defaultSnapshotGet
 	}
 	if k.list == nil {
 		k.list = defaultList
@@ -342,6 +367,31 @@ func (k *Kubeclient) Get(
 	}
 
 	return k.get(cli, name, k.namespace, opts)
+}
+
+// Get returns lvm snapshot object for given name
+func (k *Kubeclient) GetSnapshot(
+	name string,
+	opts metav1.GetOptions,
+) (*apis.LVMSnapshot, error) {
+	if name == "" {
+		return nil,
+			errors.New(
+				"failed to get lvm snapshot: missing lvm snapshot name",
+			)
+	}
+
+	cli, err := k.getClientOrCached()
+	if err != nil {
+		return nil, errors.Wrapf(
+			err,
+			"failed to get lvm snapshot {%s} in namespace {%s}",
+			name,
+			k.namespace,
+		)
+	}
+
+	return k.getSnapshot(cli, name, k.namespace, opts)
 }
 
 // GetRaw returns lvm volume instance

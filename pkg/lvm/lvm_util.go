@@ -364,10 +364,12 @@ func buildLVMSnapCreateArgs(snap *apis.LVMSnapshot) []string {
 	LVMSnapArg = append(LVMSnapArg,
 		// snapshot argument
 		"--snapshot",
+		// active the snapshot
+		"--setactivationskip", "n",
 		// name of snapshot
 		"--name", getLVMSnapName(snap.Name),
 		// set the permission to make the snapshot read-only. By default LVM snapshots are RW
-		"--permission", "r",
+		// "--permission", "r",
 		// volume to snapshot
 		volPath,
 	)

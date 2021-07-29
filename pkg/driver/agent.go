@@ -173,6 +173,34 @@ func exposeMetrics(listenAddr string, metricsPath string, disableExporterMetrics
 	}()
 }
 
+// GetSnapshotVolAndMountInfo get snapshot and mount info from node csi volume request
+func GetSnapshotAndMountInfo(
+	req *csi.NodePublishVolumeRequest,
+) (*apis.LVMSnapshot, *lvm.MountInfo, error) {
+	var mountinfo lvm.MountInfo
+
+	mountinfo.FSType = req.GetVolumeCapability().GetMount().GetFsType()
+	mountinfo.MountPath = req.GetTargetPath()
+	mountinfo.MountOptions = append(mountinfo.MountOptions, req.GetVolumeCapability().GetMount().GetMountFlags()...)
+
+	if req.GetReadonly() {
+		mountinfo.MountOptions = append(mountinfo.MountOptions, "ro")
+	}
+	volName := strings.ToLower(req.GetVolumeId())
+
+	getOptions := metav1.GetOptions{}
+	klog.Info("blaat3")
+	vol, err := volbuilder.NewKubeclient().
+		WithNamespace("openebs").
+		GetSnapshot(volName, getOptions)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return vol, &mountinfo, nil
+}
+
 // GetVolAndMountInfo get volume and mount info from node csi volume request
 func GetVolAndMountInfo(
 	req *csi.NodePublishVolumeRequest,
@@ -221,7 +249,7 @@ func (ns *node) NodePublishVolume(
 	ctx context.Context,
 	req *csi.NodePublishVolumeRequest,
 ) (*csi.NodePublishVolumeResponse, error) {
-
+	klog.Infof("blaat0")
 	var (
 		err error
 	)
@@ -229,12 +257,20 @@ func (ns *node) NodePublishVolume(
 	if err = ns.validateNodePublishReq(req); err != nil {
 		return nil, err
 	}
-
-	vol, mountInfo, err := GetVolAndMountInfo(req)
+	klog.Infof("blaat1")
+	volName := strings.ToLower(req.GetVolumeId())
+	var mountInfo *lvm.MountInfo
+	var snapvol *apis.LVMSnapshot
+	var vol *apis.LVMVolume
+	if strings.HasPrefix(volName, "snapshot-") {
+		snapvol, mountInfo, err = GetSnapshotAndMountInfo(req)
+	} else {
+		vol, mountInfo, err = GetVolAndMountInfo(req)
+	}
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-
+	klog.Infof("blaat2")
 	podLVinfo, err := getPodLVInfo(req)
 	if err != nil {
 		klog.Warningf("PodLVInfo could not be obtained for volume_id: %s, err = %v", req.VolumeId, err)
@@ -242,12 +278,21 @@ func (ns *node) NodePublishVolume(
 	switch req.GetVolumeCapability().GetAccessType().(type) {
 	case *csi.VolumeCapability_Block:
 		// attempt block mount operation on the requested path
-		err = lvm.MountBlock(vol, mountInfo, podLVinfo)
+		if vol != nil {
+			err = lvm.MountBlock(vol, mountInfo, podLVinfo)
+		} else {
+			err = lvm.MountSnapshotBlock(snapvol, mountInfo, podLVinfo)
+		}
 	case *csi.VolumeCapability_Mount:
 		// attempt filesystem mount operation on the requested path
-		err = lvm.MountFilesystem(vol, mountInfo, podLVinfo)
+		klog.Infof("blaat5")
+		if vol != nil {
+			err = lvm.MountFilesystem(vol, mountInfo, podLVinfo)
+		} else {
+			err = lvm.MountSnapshotFilesystem(snapvol, mountInfo, podLVinfo)
+		}
 	}
-
+	klog.Infof("blaat4")
 	if err != nil {
 		return nil, err
 	}
@@ -265,8 +310,9 @@ func (ns *node) NodeUnpublishVolume(
 ) (*csi.NodeUnpublishVolumeResponse, error) {
 
 	var (
-		err error
-		vol *apis.LVMVolume
+		err     error
+		vol     *apis.LVMVolume
+		snapvol *apis.LVMSnapshot
 	)
 
 	if err = ns.validateNodeUnpublishReq(req); err != nil {
@@ -275,14 +321,23 @@ func (ns *node) NodeUnpublishVolume(
 
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
+	if strings.HasPrefix(volumeID, "snapshot-") {
+		if snapvol, err = lvm.GetLVMSnapshot(volumeID); err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"not able to get the LVMSnapshot %s err : %s",
+				volumeID, err.Error())
+		}
 
-	if vol, err = lvm.GetLVMVolume(volumeID); err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"not able to get the LVMVolume %s err : %s",
-			volumeID, err.Error())
+		err = lvm.UmountSnapshot(snapvol, targetPath)
+	} else {
+		if vol, err = lvm.GetLVMVolume(volumeID); err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"not able to get the LVMVolume %s err : %s",
+				volumeID, err.Error())
+		}
+
+		err = lvm.UmountVolume(vol, targetPath)
 	}
-
-	err = lvm.UmountVolume(vol, targetPath)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,

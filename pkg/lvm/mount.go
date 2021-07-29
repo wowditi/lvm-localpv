@@ -21,6 +21,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/openebs/lib-csi/pkg/device/iolimit"
 
@@ -81,6 +82,56 @@ func FormatAndMountVol(devicePath string, mountInfo *MountInfo) error {
 
 // UmountVolume unmounts the volume and the corresponding mount path is removed
 func UmountVolume(vol *apis.LVMVolume, targetPath string,
+) error {
+	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+
+	dev, ref, err := mount.GetDeviceNameFromMount(mounter, targetPath)
+	if err != nil {
+		klog.Errorf(
+			"lvm: umount volume: failed to get device from mnt: %s\nError: %v",
+			targetPath, err,
+		)
+		return err
+	}
+
+	// device has already been un-mounted, return successful
+	if len(dev) == 0 || ref == 0 {
+		klog.Warningf(
+			"Warning: Unmount skipped because volume %s not mounted: %v",
+			vol.Name, targetPath,
+		)
+		return nil
+	}
+
+	if pathExists, pathErr := mount.PathExists(targetPath); pathErr != nil {
+		return fmt.Errorf("error checking if path exists: %v", pathErr)
+	} else if !pathExists {
+		klog.Warningf(
+			"Warning: Unmount skipped because path does not exist: %v",
+			targetPath,
+		)
+		return nil
+	}
+
+	if err = mounter.Unmount(targetPath); err != nil {
+		klog.Errorf(
+			"lvm: failed to unmount %s: path %s err: %v",
+			vol.Name, targetPath, err,
+		)
+		return err
+	}
+
+	if err := os.Remove(targetPath); err != nil {
+		klog.Errorf("lvm: failed to remove mount path vol %s err : %v", vol.Name, err)
+	}
+
+	klog.Infof("umount done %s path %v", vol.Name, targetPath)
+
+	return nil
+}
+
+// UmountVolume unmounts the volume and the corresponding mount path is removed
+func UmountSnapshot(vol *apis.LVMSnapshot, targetPath string,
 ) error {
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
 
@@ -218,6 +269,43 @@ func MountVolume(vol *apis.LVMVolume, mount *MountInfo, podLVInfo *PodLVInfo) er
 	return nil
 }
 
+// MountSnapshot mounts the disk to the specified path
+func MountSnapshot(vol *apis.LVMSnapshot, mount *MountInfo, podLVInfo *PodLVInfo) error {
+	volume := vol.Spec.VolGroup + "/" + strings.TrimLeft(vol.Name, "snapshot-")
+	// mounted, err := verifyMountRequest(vol, mount.MountPath)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// if mounted {
+	// 	klog.Infof("lvm : already mounted %s => %s", volume, mount.MountPath)
+	// 	return nil
+	// }
+
+	devicePath := DevPath + volume
+
+	err := FormatAndMountVol(devicePath, mount)
+	if err != nil {
+		return status.Errorf(
+			codes.Internal,
+			"failed to format and mount the volume error: %s",
+			err.Error(),
+		)
+	}
+
+	klog.Infof("lvm: volume %v mounted %v fs %v", volume, mount.MountPath, mount.FSType)
+
+	// if ioLimitsEnabled && podLVInfo != nil {
+	// 	if err := setIOLimits(vol, podLVInfo, devicePath); err != nil {
+	// 		klog.Warningf("lvm: error setting io limits: podUid %s, device %s, err=%v", podLVInfo.UID, devicePath, err)
+	// 	} else {
+	// 		klog.Infof("lvm: io limits set for podUid %v, device %s", podLVInfo.UID, devicePath)
+	// 	}
+	// }
+
+	return nil
+}
+
 // MountFilesystem mounts the disk to the specified path
 func MountFilesystem(vol *apis.LVMVolume, mount *MountInfo, podinfo *PodLVInfo) error {
 	if err := os.MkdirAll(mount.MountPath, 0755); err != nil {
@@ -225,6 +313,15 @@ func MountFilesystem(vol *apis.LVMVolume, mount *MountInfo, podinfo *PodLVInfo) 
 	}
 
 	return MountVolume(vol, mount, podinfo)
+}
+
+// MountSnapshotFilesystem mounts the disk to the specified path
+func MountSnapshotFilesystem(vol *apis.LVMSnapshot, mount *MountInfo, podinfo *PodLVInfo) error {
+	if err := os.MkdirAll(mount.MountPath, 0755); err != nil {
+		return status.Errorf(codes.Internal, "Could not create dir {%q}, err: %v", mount.MountPath, err)
+	}
+
+	return MountSnapshot(vol, mount, podinfo)
 }
 
 // MountBlock mounts the block disk to the specified path
@@ -260,6 +357,34 @@ func MountBlock(vol *apis.LVMVolume, mountinfo *MountInfo, podLVInfo *PodLVInfo)
 			klog.Infof("lvm: io limits set for podUid %s, device %s", podLVInfo.UID, devicePath)
 		}
 	}
+	return nil
+}
+
+// MountBlock mounts the block disk to the specified path
+func MountSnapshotBlock(vol *apis.LVMSnapshot, mountinfo *MountInfo, podLVInfo *PodLVInfo) error {
+	target := mountinfo.MountPath
+	volume := vol.Spec.VolGroup + "/" + vol.Name
+	devicePath := DevPath + volume
+
+	mountopt := []string{"bind"}
+
+	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
+
+	// Create the mount point as a file since bind mount device node requires it to be a file
+	err := makeFile(target)
+	if err != nil {
+		return status.Errorf(codes.Internal, "Could not create target file %q: %v", target, err)
+	}
+
+	// do the bind mount of the device at the target path
+	if err := mounter.Mount(devicePath, target, "", mountopt); err != nil {
+		if removeErr := os.Remove(target); removeErr != nil {
+			return status.Errorf(codes.Internal, "Could not remove mount target %q: %v", target, removeErr)
+		}
+		return status.Errorf(codes.Internal, "mount failed at %v err : %v", target, err)
+	}
+
+	klog.Infof("NodePublishVolume mounted block device %s at %s", devicePath, target)
 	return nil
 }
 
